@@ -1,5 +1,11 @@
 #define NPROC       64                // maximum number of processes
 #define NCPU        8                 // maximum number of CPUs
+
+#define PRIORITY_MIN      0           // highest scheduling priority
+#define PRIORITY_MAX      4           // lowest scheduling priority
+#define DEFAULT_PRIORITY  2           // default process priority
+#define AGING_INTERVAL   20           // ticks before temporary priority boost
+
 #define NOFILE      16                // open files per process
 #define NFILE       100               // open files per system
 #define NINODE      50                // maximum number of active i-nodes

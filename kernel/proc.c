@@ -230,6 +230,7 @@ userinit(void)
 
   p->cwd = namei("/");
 
+  p->ready_since = 0;
   p->state = RUNNABLE;
 
   release(&p->lock);
@@ -303,6 +304,8 @@ kfork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
+  np->priority = p->priority;
+  np->ready_since = 0;
   np->state = RUNNABLE;
   release(&np->lock);
 

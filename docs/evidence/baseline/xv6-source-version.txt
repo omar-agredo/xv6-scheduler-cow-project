@@ -1,0 +1,19 @@
+=== FUENTE XV6 ===
+Fecha de registro: Wed Jul 15 08:22:18 PM -05 2026
+
+Repositorio remoto:
+origin	https://github.com/mit-pdos/xv6-riscv.git (fetch)
+origin	https://github.com/mit-pdos/xv6-riscv.git (push)
+
+Rama actual:
+main
+
+Commit completo:
+1982fd12595f52a0e5ef8db466257a01fb1fbfef
+
+Tags:
+baseline-original
+xv6-riscv-rev5
+
+Estado del repositorio:
+ M Makefile

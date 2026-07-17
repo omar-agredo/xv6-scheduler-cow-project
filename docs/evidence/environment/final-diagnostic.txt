@@ -1,0 +1,17 @@
+=== FECHA ===
+Wed Jul 15 08:21:51 PM -05 2026
+
+=== SISTEMA ANFITRION ===
+Fedora release 44 (Forty Four)
+Linux fedora-uwu 7.1.3-200.fc44.x86_64 #1 SMP PREEMPT_DYNAMIC Sat Jul  4 19:20:12 UTC 2026 x86_64 GNU/Linux
+x86_64
+
+=== HERRAMIENTAS ===
+git version 2.55.0
+GNU Make 4.4.1
+gcc (GCC) 16.1.1 20260515 (Red Hat 16.1.1-2)
+QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)
+riscv64-linux-gnu-gcc (GCC) 16.1.1 20260501 (Red Hat Cross 16.1.1-1)
+GNU ld version 2.46-1.fc44
+GNU objdump version 2.46-1.fc44
+GNU gdb (Fedora Linux) 17.2-1.fc44

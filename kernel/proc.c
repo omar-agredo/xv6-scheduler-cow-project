@@ -435,35 +435,69 @@ scheduler(void)
   struct cpu *c = mycpu();
 
   c->proc = 0;
+
   for (;;) {
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
+    // Enable interrupts so devices can wake sleeping processes.
+    // Disable them again before potentially executing wfi.
     intr_on();
     intr_off();
 
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+    uint now;
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+    // Take one safe snapshot of the global clock for this
+    // scheduling round. Release tickslock before taking p->lock
+    // to preserve the existing lock order.
+    acquire(&tickslock);
+    now = ticks;
+    release(&tickslock);
+
+    int found = 0;
+
+    // Lower numeric value means higher scheduling priority.
+    for (int level = PRIORITY_MIN; level <= PRIORITY_MAX; level++) {
+      int level_found = 0;
+
+      for (p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+
+        if (p->state == RUNNABLE) {
+          // A zero value marks a new RUNNABLE waiting period.
+          if (p->ready_since == 0)
+            p->ready_since = now;
+
+          uint waited = now - p->ready_since;
+          int aging_steps = waited / AGING_INTERVAL;
+          int effective_priority = p->priority - aging_steps;
+
+          if (effective_priority < PRIORITY_MIN)
+            effective_priority = PRIORITY_MIN;
+
+          if (effective_priority == level) {
+            // Run every process at the highest available
+            // effective-priority level once per round.
+            p->state = RUNNING;
+            c->proc = p;
+
+            swtch(&c->context, &p->context);
+
+            // The process changed its state before returning.
+            c->proc = 0;
+            found = 1;
+            level_found = 1;
+          }
+        }
+
+        release(&p->lock);
       }
-      release(&p->lock);
+
+      // Do not run lower-priority levels while at least one
+      // process existed at this effective-priority level.
+      if (level_found)
+        break;
     }
+
     if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+      // Nothing is runnable on this CPU.
       asm volatile("wfi");
     }
   }

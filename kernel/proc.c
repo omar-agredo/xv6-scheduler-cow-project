@@ -502,6 +502,7 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
+  p->ready_since = 0;
   p->state = RUNNABLE;
   sched();
   release(&p->lock);
@@ -586,6 +587,7 @@ wakeup(void *chan)
     if (p != myproc()) {
       acquire(&p->lock);
       if (p->state == SLEEPING && p->chan == chan) {
+        p->ready_since = 0;
         p->state = RUNNABLE;
       }
       release(&p->lock);
@@ -607,6 +609,7 @@ kkill(int pid)
       p->killed = 1;
       if (p->state == SLEEPING) {
         // Wake process from sleep().
+        p->ready_since = 0;
         p->state = RUNNABLE;
       }
       release(&p->lock);

@@ -1,5 +1,10 @@
-# xv6: Scheduler por prioridades con Aging y Copy-on-Write
+## Entrega final
 
+- [Informe final en PDF](docs/report/Informe_Final_xv6_Omar_Esteban_Agredo.pdf)
+- [Video de demostración](PEGA_AQUI_EL_LINK_DE_YOUTUBE)
+- Rama final: `feature/scheduler-priority-aging`
+
+# xv6: Scheduler por prioridades con Aging y Copy-on-Write
 Proyecto de modificación del sistema operativo educativo **xv6-riscv**.
 
 El proyecto estudia el funcionamiento original de xv6 y añade dos mejoras principales:

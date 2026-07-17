@@ -1,585 +1,288 @@
-## Entrega final
+# xv6: Priority Scheduler with Aging and Copy-on-Write Fork
 
-- [Informe final en PDF](docs/report/Informe_Final_xv6_Omar_Esteban_Agredo.pdf)
-- [Video de demostración](https://youtu.be/xQVmq0OP8is)
-- Rama final: `feature/scheduler-priority-aging`
+This project extends the **xv6-riscv** educational operating system with
+two major kernel modifications:
 
-# xv6: Scheduler por prioridades con Aging y Copy-on-Write
-Proyecto de modificación del sistema operativo educativo **xv6-riscv**.
+1. A priority-based scheduler with an aging mechanism to prevent starvation.
+2. A Copy-on-Write (COW) `fork()` implementation that defers page copying.
 
-El proyecto estudia el funcionamiento original de xv6 y añade dos mejoras principales:
-
-1. un scheduler por prioridades con mecanismo de aging;
-2. una implementación de `fork()` basada en Copy-on-Write.
-
-Las modificaciones conservan compatibilidad con el comportamiento general de xv6 y fueron validadas mediante pruebas específicas y la suite completa `usertests`.
+All changes preserve compatibility with xv6's original behavior and have
+been validated against both custom tests and the full `usertests` suite.
 
 ---
 
-## Objetivos
+## Overview
 
-- Analizar el scheduler original de xv6.
-- Diseñar e implementar prioridades para procesos.
-- Evitar starvation mediante aging.
-- Analizar la administración original de memoria.
-- Optimizar `fork()` mediante Copy-on-Write.
-- Mantener aislamiento entre procesos.
-- Validar las modificaciones mediante pruebas reproducibles.
-- Documentar decisiones, resultados y errores encontrados.
+The original xv6 scheduler uses a round-robin policy. This project
+replaces it with a fixed-priority scheduler that ages waiting processes,
+and replaces the eager-copy `fork()` with a COW strategy that shares
+physical pages until a write occurs.
 
----
+## Main Features
 
-# 1. Scheduler por prioridades con Aging
+- 5-level priority scheduling (0 = highest, 4 = lowest)
+- Aging: a process gains one effective priority level every 20 ticks
+  while waiting in the `RUNNABLE` state
+- `setpriority(int priority)` system call
+- COW fork with per-physical-page reference counters
+- Copy-on-Write page-fault resolution in `usertrap()` and `copyout()`
+- Compatible with single-CPU and multi-CPU configurations
+- Passes the complete `usertests -q` regression suite
 
-## Prioridades
+## Original xv6 Behavior
 
-Cada proceso tiene una prioridad base:
+- **Scheduler**: round-robin across all `RUNNABLE` processes with no
+  notion of priority.
+- **fork()**: `uvmcopy()` eagerly allocates new physical pages and copies
+  all parent mappings into the child.
+- **Memory**: no reference counters; `kfree()` immediately returns a page
+  to the free list.
 
-| Prioridad | Significado |
-|---:|---|
-| 0 | Más alta |
-| 1 | Alta |
-| 2 | Predeterminada |
-| 3 | Baja |
-| 4 | Más baja |
+## Priority Scheduler with Aging
 
-La prioridad predeterminada es:
+### Priorities
 
-```c
-#define DEFAULT_PRIORITY 2
-```
+| Priority | Meaning       |
+|--------:|---------------|
+| 0        | Highest       |
+| 1        | High          |
+| 2        | Default       |
+| 3        | Low           |
+| 4        | Lowest        |
 
-Los procesos hijos heredan la prioridad base de su padre.
-
-## Aging
-
-Un proceso de baja prioridad podría esperar indefinidamente si siempre existen procesos con prioridad superior.
-
-Para evitarlo, el scheduler calcula una prioridad efectiva:
-
-```text
-prioridad efectiva =
-prioridad base - tiempo de espera / intervalo de aging
-```
-
-Configuración utilizada:
+Configuration constants (defined in `kernel/param.h`):
 
 ```c
-#define PRIORITY_MIN 0
-#define PRIORITY_MAX 4
+#define PRIORITY_MIN     0
+#define PRIORITY_MAX     4
 #define DEFAULT_PRIORITY 2
-#define AGING_INTERVAL 20
+#define AGING_INTERVAL  20   // ticks
 ```
 
-Cada 20 ticks de espera en estado `RUNNABLE`, el proceso asciende temporalmente un nivel.
+Child processes inherit the base priority of their parent.
 
-La prioridad base almacenada no se modifica.
+### Aging
 
-## System call
+To prevent starvation, the scheduler computes an effective priority:
 
-Se añadió:
+```
+effective priority = base priority - wait time / AGING_INTERVAL
+```
+
+Every 20 ticks spent in the `RUNNABLE` state, the process effectively
+moves up one priority level. The stored base priority is never modified.
+
+### System Call
 
 ```c
 int setpriority(int priority);
 ```
 
-Esta llamada permite que un proceso configure su prioridad base entre `0` y `4`.
+Sets the calling process's base priority (0–4). Returns 0 on success,
+-1 on error.
 
-Ejemplo:
+Example:
 
 ```c
 if (setpriority(0) < 0) {
-  printf("invalid priority\n");
-  exit(1);
+    printf("invalid priority\n");
+    exit(1);
 }
 ```
 
-## Resultado del aging
+### Aging Test Result
 
-En la prueba realizada:
-
-```text
+```
 High-priority process started: tick=9387
-Low-priority process entered: tick=9388
-Low-priority process resumed: tick=9469 waited=81
+Low-priority process entered:  tick=9388
+Low-priority process resumed:  tick=9469  waited=81
 High-priority process finished: tick=9507
 ```
 
-El proceso con prioridad `4` necesitaba ascender cuatro niveles:
+A priority-4 process needs to climb 4 levels:
 
-```text
-4 niveles × 20 ticks = 80 ticks
+```
+4 levels × 20 ticks = 80 ticks
 ```
 
-El proceso reanudó después de 81 ticks y antes de que finalizara el proceso de prioridad alta.
+The process resumed after 81 ticks, before the high-priority process
+finished — confirming that aging prevents starvation.
 
-Esto demuestra que el aging evita starvation.
+## Copy-on-Write Fork
 
----
+### Original Problem
 
-# 2. Copy-on-Write Fork
+The original `fork()` calls `uvmcopy()`, which:
 
-## Problema original
+1. Allocates new physical pages for the child.
+2. Copies all page content from the parent.
+3. Maps the copies into the child's page table.
 
-La implementación original de `fork()` usa `uvmcopy()` para:
+This wastes time and memory, especially when the child calls `exec()`
+immediately.
 
-1. reservar nuevas páginas físicas;
-2. copiar todas las páginas del padre;
-3. mapearlas en el hijo.
+### COW Solution
 
-Esto puede desperdiciar tiempo y memoria, especialmente cuando el hijo ejecuta `exec()` inmediatamente.
+With Copy-on-Write:
 
-## Solución implementada
-
-Con Copy-on-Write:
-
-```text
+```
 fork()
-├── padre e hijo comparten las páginas físicas
-├── se elimina temporalmente el permiso de escritura
-├── las páginas se marcan como COW
-└── la copia ocurre únicamente cuando alguien escribe
+├── parent and child share physical pages
+├── write permission is temporarily removed
+├── pages are marked with PTECOW
+└── actual copying occurs only on a write
 ```
 
-Se utilizó un bit reservado del PTE:
+A reserved PTE bit is used:
 
 ```c
 #define PTE_COW (1L << 8)
 ```
 
-## Contadores de referencia
+### Reference Counters
 
-Cada página física mantiene un contador:
+Each physical page has a reference counter:
 
-```text
-1 referencia  → una estructura usa la página
-2 referencias → padre e hijo comparten la página
-3 referencias → padre, hijo y nieto comparten la página
-0 referencias → la página vuelve a la lista libre
-```
+| References | Meaning                                     |
+|-----------:|---------------------------------------------|
+| 1          | Owned by a single address space             |
+| 2          | Shared by parent and child                  |
+| 3          | Shared by parent, child, and grandchild     |
+| 0          | Page is returned to the free list           |
 
-Funciones añadidas:
+New functions:
 
 ```c
-void kaddref(void *);
-int kgetref(void *);
+void kaddref(void *pa);
+int  kgetref(void *pa);
 ```
 
-`kfree()` libera una página físicamente solo cuando el contador llega a cero.
+`kfree()` only returns a page to the free list when its counter reaches
+zero.
 
-## Resolución del page fault
+### Page-Fault Resolution
 
-Cuando un proceso intenta escribir en una página COW:
+When a process writes to a COW page:
 
-```text
+```
 store page fault
 → usertrap()
 → cowfault()
 ```
 
-Si la página tiene varias referencias:
+**Multiple references:** allocate a new page, copy the content, map the
+private copy, decrement the original counter, restore write permission.
 
-```text
-reservar una página nueva
-→ copiar el contenido
-→ mapear la copia privada
-→ reducir el contador anterior
-→ restaurar permiso de escritura
-```
+**Single reference:** clear `PTE_COW`, restore `PTE_W`, and continue
+without copying.
 
-Si solo queda una referencia:
-
-```text
-eliminar PTE_COW
-→ restaurar PTE_W
-→ continuar sin realizar una copia
-```
-
-`copyout()` también fue adaptado para resolver páginas COW cuando el kernel escribe en memoria de usuario.
+`copyout()` is also adapted to resolve COW pages when the kernel writes
+to user memory.
 
 ---
 
-# Archivos principales modificados
+## Development Environment
 
-| Archivo | Cambio |
-|---|---|
-| `kernel/param.h` | Constantes de prioridad y aging |
-| `kernel/proc.h` | Campos `priority` y `ready_since` |
-| `kernel/proc.c` | Scheduler, herencia y transiciones de estado |
-| `kernel/syscall.h` | Número de `setpriority` |
-| `kernel/syscall.c` | Registro de la syscall |
-| `kernel/sysproc.c` | Implementación de `sys_setpriority` |
-| `kernel/riscv.h` | Bit `PTE_COW` |
-| `kernel/kalloc.c` | Contadores de referencia |
-| `kernel/vm.c` | `uvmcopy()`, `cowfault()` y `copyout()` |
-| `kernel/trap.c` | Resolución de store page faults COW |
-| `user/schedtest.c` | Prueba de prioridades |
-| `user/agingtest.c` | Prueba de aging |
-| `user/cowtest.c` | Prueba de Copy-on-Write |
-| `user/usys.pl` | Stub de `setpriority` |
-| `user/user.h` | Declaración de `setpriority` |
-| `Makefile` | Programas de prueba y compatibilidad |
+- **OS**: Fedora 44
+- **QEMU**: with RISC-V support (`riscv64-softmmu`)
+- **Toolchain**: `riscv64-linux-gnu-*`
+- **GCC fix**: `-Wno-error=unused-but-set-variable` added for GCC 16
+  compatibility.
 
----
+## Repository Structure
 
-# Compilación
+```
+docs/
+├── evidence/         screenshots and logs
+├── notes/            design and analysis notes
+└── results/          priority, aging, and COW results
+```
 
-## Requisitos
+## Modified Files
 
-- QEMU con soporte RISC-V
-- Toolchain `riscv64-linux-gnu`
-- GNU Make
-- Git
+| File                  | Change                                           |
+|-----------------------|--------------------------------------------------|
+| `kernel/param.h`      | Priority and aging constants                     |
+| `kernel/proc.h`       | `priority` and `ready_since` fields              |
+| `kernel/proc.c`       | Scheduler, priority inheritance, state transitions |
+| `kernel/syscall.h`    | `setpriority` syscall number                     |
+| `kernel/syscall.c`    | Syscall registration                             |
+| `kernel/sysproc.c`    | `sys_setpriority` implementation                 |
+| `kernel/riscv.h`      | `PTE_COW` bit definition                         |
+| `kernel/kalloc.c`     | Reference counters                               |
+| `kernel/vm.c`         | `uvmcopy()`, `cowfault()`, `copyout()`           |
+| `kernel/trap.c`       | COW store page-fault handling                    |
+| `user/schedtest.c`    | Priority scheduling test                         |
+| `user/agingtest.c`    | Aging test                                       |
+| `user/cowtest.c`      | Copy-on-Write test                               |
+| `user/usys.pl`        | `setpriority` stub                               |
+| `user/user.h`         | `setpriority` declaration                        |
+| `Makefile`            | Test program entries                             |
 
-El proyecto fue desarrollado y validado en Fedora 44.
-
-## Compilar
+## Build Instructions
 
 ```bash
 make clean
 make
 ```
 
-## Ejecutar con una CPU
+## Running xv6
+
+With one CPU (recommended for deterministic scheduling tests):
 
 ```bash
 make qemu CPUS=1
 ```
 
-## Ejecutar con varias CPUs
+With multiple CPUs:
 
 ```bash
 make qemu
 ```
 
-Para salir de QEMU:
+Exit QEMU: `Ctrl+A` then `X`.
 
-```text
-Ctrl+A
-X
+## Tests
+
+Run each test from the xv6 shell:
+
 ```
-
----
-
-# Pruebas
-
-## Scheduler
-
-Dentro de xv6:
-
-```text
 schedtest
 ```
 
-Prueba procesos con prioridades:
+Tests processes with priorities 0, 2, and 4.
 
-```text
-0, 2 y 4
 ```
-
-## Aging
-
-```text
 agingtest
 ```
 
-El proceso de prioridad baja debe reanudar cerca de los 80 ticks y antes de que termine el proceso de prioridad alta.
+Verifies that a low-priority process resumes after approximately 80 ticks.
 
-## Copy-on-Write
-
-```text# xv6: Scheduler por prioridades con Aging y Copy-on-Write
-
-Proyecto de modificación del sistema operativo educativo **xv6-riscv**.
-
-El proyecto estudia el funcionamiento original de xv6 y añade dos mejoras principales:
-
-1. un scheduler por prioridades con mecanismo de aging;
-2. una implementación de `fork()` basada en Copy-on-Write.
-
-Las modificaciones conservan compatibilidad con el comportamiento general de xv6 y fueron validadas mediante pruebas específicas y la suite completa `usertests`.
-
----
-
-## Objetivos
-
-- Analizar el scheduler original de xv6.
-- Diseñar e implementar prioridades para procesos.
-- Evitar starvation mediante aging.
-- Analizar la administración original de memoria.
-- Optimizar `fork()` mediante Copy-on-Write.
-- Mantener aislamiento entre procesos.
-- Validar las modificaciones mediante pruebas reproducibles.
-- Documentar decisiones, resultados y errores encontrados.
-
----
-
-# 1. Scheduler por prioridades con Aging
-
-## Prioridades
-
-Cada proceso tiene una prioridad base:
-
-| Prioridad | Significado |
-|---:|---|
-| 0 | Más alta |
-| 1 | Alta |
-| 2 | Predeterminada |
-| 3 | Baja |
-| 4 | Más baja |
-
-La prioridad predeterminada es:
-
-```c
-#define DEFAULT_PRIORITY 2
 ```
-
-Los procesos hijos heredan la prioridad base de su padre.
-
-## Aging
-
-Un proceso de baja prioridad podría esperar indefinidamente si siempre existen procesos con prioridad superior.
-
-Para evitarlo, el scheduler calcula una prioridad efectiva:
-
-```text
-prioridad efectiva =
-prioridad base - tiempo de espera / intervalo de aging
-```
-
-Configuración utilizada:
-
-```c
-#define PRIORITY_MIN 0
-#define PRIORITY_MAX 4
-#define DEFAULT_PRIORITY 2
-#define AGING_INTERVAL 20
-```
-
-Cada 20 ticks de espera en estado `RUNNABLE`, el proceso asciende temporalmente un nivel.
-
-La prioridad base almacenada no se modifica.
-
-## System call
-
-Se añadió:
-
-```c
-int setpriority(int priority);
-```
-
-Esta llamada permite que un proceso configure su prioridad base entre `0` y `4`.
-
-Ejemplo:
-
-```c
-if (setpriority(0) < 0) {
-  printf("invalid priority\n");
-  exit(1);
-}
-```
-
-## Resultado del aging
-
-En la prueba realizada:
-
-```text
-High-priority process started: tick=9387
-Low-priority process entered: tick=9388
-Low-priority process resumed: tick=9469 waited=81
-High-priority process finished: tick=9507
-```
-
-El proceso con prioridad `4` necesitaba ascender cuatro niveles:
-
-```text
-4 niveles × 20 ticks = 80 ticks
-```
-
-El proceso reanudó después de 81 ticks y antes de que finalizara el proceso de prioridad alta.
-
-Esto demuestra que el aging evita starvation.
-
----
-
-# 2. Copy-on-Write Fork
-
-## Problema original
-
-La implementación original de `fork()` usa `uvmcopy()` para:
-
-1. reservar nuevas páginas físicas;
-2. copiar todas las páginas del padre;
-3. mapearlas en el hijo.
-
-Esto puede desperdiciar tiempo y memoria, especialmente cuando el hijo ejecuta `exec()` inmediatamente.
-
-## Solución implementada
-
-Con Copy-on-Write:
-
-```text
-fork()
-├── padre e hijo comparten las páginas físicas
-├── se elimina temporalmente el permiso de escritura
-├── las páginas se marcan como COW
-└── la copia ocurre únicamente cuando alguien escribe
-```
-
-Se utilizó un bit reservado del PTE:
-
-```c
-#define PTE_COW (1L << 8)
-```
-
-## Contadores de referencia
-
-Cada página física mantiene un contador:
-
-```text
-1 referencia  → una estructura usa la página
-2 referencias → padre e hijo comparten la página
-3 referencias → padre, hijo y nieto comparten la página
-0 referencias → la página vuelve a la lista libre
-```
-
-Funciones añadidas:
-
-```c
-void kaddref(void *);
-int kgetref(void *);
-```
-
-`kfree()` libera una página físicamente solo cuando el contador llega a cero.
-
-## Resolución del page fault
-
-Cuando un proceso intenta escribir en una página COW:
-
-```text
-store page fault
-→ usertrap()
-→ cowfault()
-```
-
-Si la página tiene varias referencias:
-
-```text
-reservar una página nueva
-→ copiar el contenido
-→ mapear la copia privada
-→ reducir el contador anterior
-→ restaurar permiso de escritura
-```
-
-Si solo queda una referencia:
-
-```text
-eliminar PTE_COW
-→ restaurar PTE_W
-→ continuar sin realizar una copia
-```
-
-`copyout()` también fue adaptado para resolver páginas COW cuando el kernel escribe en memoria de usuario.
-
----
-
-# Archivos principales modificados
-
-| Archivo | Cambio |
-|---|---|
-| `kernel/param.h` | Constantes de prioridad y aging |
-| `kernel/proc.h` | Campos `priority` y `ready_since` |
-| `kernel/proc.c` | Scheduler, herencia y transiciones de estado |
-| `kernel/syscall.h` | Número de `setpriority` |
-| `kernel/syscall.c` | Registro de la syscall |
-| `kernel/sysproc.c` | Implementación de `sys_setpriority` |
-| `kernel/riscv.h` | Bit `PTE_COW` |
-| `kernel/kalloc.c` | Contadores de referencia |
-| `kernel/vm.c` | `uvmcopy()`, `cowfault()` y `copyout()` |
-| `kernel/trap.c` | Resolución de store page faults COW |
-| `user/schedtest.c` | Prueba de prioridades |
-| `user/agingtest.c` | Prueba de aging |
-| `user/cowtest.c` | Prueba de Copy-on-Write |
-| `user/usys.pl` | Stub de `setpriority` |
-| `user/user.h` | Declaración de `setpriority` |
-| `Makefile` | Programas de prueba y compatibilidad |
-
----
-
-# Compilación
-
-## Requisitos
-
-- QEMU con soporte RISC-V
-- Toolchain `riscv64-linux-gnu`
-- GNU Make
-- Git
-
-El proyecto fue desarrollado y validado en Fedora 44.
-
-## Compilar
-
-```bash
-make clean
-make
-```
-
-## Ejecutar con una CPU
-
-```bash
-make qemu CPUS=1
-```
-
-## Ejecutar con varias CPUs
-
-```bash
-make qemu
-```
-
-Para salir de QEMU:
-
-```text
-Ctrl+A
-X
-```
-
----
-
-# Pruebas
-
-## Scheduler
-
-Dentro de xv6:
-
-```text
-schedtest
-```
-
-Prueba procesos con prioridades:
-
-```text
-0, 2 y 4
-```
-
-## Aging
-
-```text
-agingtest
-```
-
-El proceso de prioridad baja debe reanudar cerca de los 80 ticks y antes de que termine el proceso de prioridad alta.
-
-## Copy-on-Write
-
-```text
 cowtest
 ```
 
-La prueba utiliza padre, hijo y nieto compartiendo inicialmente 16 páginas.
+Creates a parent, child, and grandchild sharing 16 pages. Each process
+writes to its pages and verifies isolation.
 
-Resultado esperado:
+```
+usertests -q
+```
 
-```text
+The full xv6 regression suite.
+
+## Expected Results
+
+### Scheduler
+
+- Priority 0 processes are scheduled before priority 2 and 4.
+- Processes with the same priority share CPU time fairly.
+- Aging lets low-priority processes make progress.
+- Works with both 1 and multiple CPUs.
+
+### Copy-on-Write
+
+```
 === Copy-on-Write test ===
 Parent initialized 16 pages with P
 Grandchild has private copies: OK
@@ -588,67 +291,33 @@ Parent pages remained unchanged: OK
 === Copy-on-Write test passed ===
 ```
 
-## Suite completa
+### Full Regression
 
-```text
-usertests -q
 ```
-
-Resultado obtenido:
-
-```text
 ALL TESTS PASSED
 ```
 
-También se validó:
-
-```text
-forktest
-schedtest
-agingtest
-cowtest
-```
-
 ---
 
-# Resultados principales
+## Git Branches and Tags
 
-## Scheduler
+| Tag / Branch                          | Description                        |
+|---------------------------------------|------------------------------------|
+| `baseline-original`                   | Unmodified MIT xv6-riscv           |
+| `baseline-fedora44`                   | Baseline ported to Fedora 44       |
+| `scheduler-priority-aging-v1`         | First stable scheduler release     |
+| `cow-fork-v1`                         | First stable COW release           |
+| `feature/scheduler-priority-aging`    | Final project branch               |
 
-- La prioridad `0` recibe preferencia frente a `2` y `4`.
-- Los procesos de una misma prioridad conservan turnos de ejecución.
-- El aging permite que los procesos de baja prioridad progresen.
-- Funciona con una y varias CPUs.
+The implementation reference commit is `f83ee36`.
 
-## Copy-on-Write
-
-- Padre e hijo comparten inicialmente páginas físicas.
-- Las escrituras crean copias privadas.
-- Padre, hijo y nieto mantienen contenidos independientes.
-- Los contadores de referencia evitan liberaciones prematuras.
-- Lazy allocation continúa funcionando.
-- La suite general de xv6 termina correctamente.
-
----
-
-# Tags importantes
-
-```text
-baseline-original
-baseline-fedora44
-scheduler-priority-aging-v1
-cow-fork-v1
-```
-
-Estos tags permiten comparar el xv6 original con las versiones estables de cada modificación.
-
-Ejemplo:
+To explore a tag:
 
 ```bash
 git checkout baseline-original
 ```
 
-Para regresar a la versión final:
+To return to the final version:
 
 ```bash
 git checkout feature/scheduler-priority-aging
@@ -656,245 +325,39 @@ git checkout feature/scheduler-priority-aging
 
 ---
 
-# Errores encontrados y correcciones
+## Final Report
 
-## Compatibilidad con GCC 16
+The full project report is available at:
 
-La compilación original trataba una advertencia de `usertests.c` como error.
-
-Se añadió:
-
-```text
--Wno-error=unused-but-set-variable
+```
+docs/report/Informe_Final_xv6_Omar_Esteban_Agredo.pdf
 ```
 
-## Dirección superior a MAXVA
+## Video Demonstration
 
-Durante `MAXVAplus` apareció:
-
-```text
-panic: walk
-```
-
-La causa era que `cowfault()` llamaba a `walk()` con una dirección virtual inválida.
-
-Se corrigió con:
-
-```c
-if (va >= MAXVA)
-  return 0;
-```
-
-Después de la corrección:
-
-```text
-ALL TESTS PASSED
-```
+[Video demonstration](https://youtu.be/xQVmq0OP8is)
 
 ---
 
-# Estructura de documentación
+## Author
 
-La documentación complementaria se mantiene en el directorio hermano:
+**Omar Esteban Agredo**  
+Course: Operating Systems  
+Institution: Universidad del Valle
 
-```text
-docs/
-├── evidence/
-├── notes/
-└── results/
-```
+## Academic Context
 
-Incluye:
+This project was developed as the final assignment for the Operating
+Systems course at Universidad del Valle. It is based on xv6-riscv and
+is intended for educational purposes only.
 
-- análisis del scheduler original;
-- diseño del scheduler;
-- resultados de prioridades y aging;
-- análisis de memoria;
-- resultados de Copy-on-Write;
-- capturas de compilación y pruebas.
+## References
 
----
+- [MIT 6.1810 / 6.S081: Operating System Engineering](https://pdos.csail.mit.edu/6.1810/)
+- [xv6-riscv source code](https://github.com/mit-pdos/xv6-riscv)
+- Lions, John. *Commentary on UNIX 6th Edition*. Peer to Peer
+  Communications, 2000.
 
-# Autor
-
-Proyecto académico de Sistemas Operativos.
-
-Desarrollado sobre xv6-riscv con fines educativos.
-
----
-
-# Créditos de xv6
-
-xv6 es una reimplementación educativa de Unix Version 6 desarrollada por MIT para la enseñanza de sistemas operativos.
-
-Sitio oficial del curso:
-
-```text
-https://pdos.csail.mit.edu/6.1810/
-```
-
-El código base y sus autores originales conservan sus respectivos créditos.
-cowtest
-```
-
-La prueba utiliza padre, hijo y nieto compartiendo inicialmente 16 páginas.
-
-Resultado esperado:
-
-```text
-=== Copy-on-Write test ===
-Parent initialized 16 pages with P
-Grandchild has private copies: OK
-Child has private copies: OK
-Parent pages remained unchanged: OK
-=== Copy-on-Write test passed ===
-```
-
-## Suite completa
-
-```text
-usertests -q
-```
-
-Resultado obtenido:
-
-```text
-ALL TESTS PASSED
-```
-
-También se validó:
-
-```text
-forktest
-schedtest
-agingtest
-cowtest
-```
-
----
-
-# Resultados principales
-
-## Scheduler
-
-- La prioridad `0` recibe preferencia frente a `2` y `4`.
-- Los procesos de una misma prioridad conservan turnos de ejecución.
-- El aging permite que los procesos de baja prioridad progresen.
-- Funciona con una y varias CPUs.
-
-## Copy-on-Write
-
-- Padre e hijo comparten inicialmente páginas físicas.
-- Las escrituras crean copias privadas.
-- Padre, hijo y nieto mantienen contenidos independientes.
-- Los contadores de referencia evitan liberaciones prematuras.
-- Lazy allocation continúa funcionando.
-- La suite general de xv6 termina correctamente.
-
----
-
-# Tags importantes
-
-```text
-baseline-original
-baseline-fedora44
-scheduler-priority-aging-v1
-cow-fork-v1
-```
-
-Estos tags permiten comparar el xv6 original con las versiones estables de cada modificación.
-
-Ejemplo:
-
-```bash
-git checkout baseline-original
-```
-
-Para regresar a la versión final:
-
-```bash
-git checkout feature/scheduler-priority-aging
-```
-
----
-
-# Errores encontrados y correcciones
-
-## Compatibilidad con GCC 16
-
-La compilación original trataba una advertencia de `usertests.c` como error.
-
-Se añadió:
-
-```text
--Wno-error=unused-but-set-variable
-```
-
-## Dirección superior a MAXVA
-
-Durante `MAXVAplus` apareció:
-
-```text
-panic: walk
-```
-
-La causa era que `cowfault()` llamaba a `walk()` con una dirección virtual inválida.
-
-Se corrigió con:
-
-```c
-if (va >= MAXVA)
-  return 0;
-```
-
-Después de la corrección:
-
-```text
-ALL TESTS PASSED
-```
-
----
-
-# Estructura de documentación
-
-La documentación complementaria se mantiene en el directorio hermano:
-
-```text
-docs/
-├── evidence/
-├── notes/
-└── results/
-```
-
-Incluye:
-
-- análisis del scheduler original;
-- diseño del scheduler;
-- resultados de prioridades y aging;
-- análisis de memoria;
-- resultados de Copy-on-Write;
-- capturas de compilación y pruebas.
-
----
-
-# Autor
-
-OMAR ESTEBAN AGREDO
-
-Proyecto académico de Sistemas Operativos.
-
-Desarrollado sobre xv6-riscv con fines educativos.
-
----
-
-# Créditos de xv6
-
-xv6 es una reimplementación educativa de Unix Version 6 desarrollada por MIT para la enseñanza de sistemas operativos.
-
-Sitio oficial del curso:
-
-```text
-https://pdos.csail.mit.edu/6.1810/
-```
-
-El código base y sus autores originales conservan sus respectivos créditos.
+xv6 is a re-implementation of Unix Version 6 (v6) by Dennis Ritchie and
+Ken Thompson, maintained by the MIT PDOS group. All original authors and
+contributors retain their respective credits.

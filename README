@@ -1,0 +1,35 @@
+xv6 — Priority Scheduler with Aging & Copy-on-Write Fork
+=========================================================
+
+This is a modified version of xv6-riscv for the Operating Systems
+course at Universidad del Valle.  It implements:
+
+  1. A priority-based scheduler with an aging mechanism.
+  2. A Copy-on-Write (COW) fork() implementation.
+
+Author:     Omar Esteban Agredo
+Institution: Universidad del Valle
+Course:      Operating Systems
+Branch:      feature/scheduler-priority-aging
+
+Build & run
+-----------
+
+    $ make clean
+    $ make
+    $ make qemu CPUS=1
+
+Inside xv6:
+
+    schedtest
+    agingtest
+    cowtest
+    usertests -q
+
+Upstream
+--------
+
+xv6 is a re-implementation of Unix Version 6 (v6) by Dennis Ritchie
+and Ken Thompson, maintained at MIT for educational purposes.
+
+    https://pdos.csail.mit.edu/6.1810/

@@ -148,6 +148,7 @@ UPROGS=\
 	$U/_sync\
 	$U/_schedtest\
 	$U/_agingtest\
+	$U/_cowtest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

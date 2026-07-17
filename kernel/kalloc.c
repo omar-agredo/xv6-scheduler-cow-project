@@ -23,10 +23,21 @@ struct {
   struct run *freelist;
 } kmem;
 
+// One reference counter for every possible physical page.
+static int refcount[PHYSTOP / PGSIZE];
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+
+  // freerange() initializes every usable page through kfree().
+  // Start each page at one reference so kfree() can reduce it to zero.
+  for (uint64 pa = PGROUNDUP((uint64)end);
+       pa + PGSIZE <= PHYSTOP;
+       pa += PGSIZE)
+    refcount[pa / PGSIZE] = 1;
+
   freerange(end, (void *)PHYSTOP);
 }
 
@@ -47,20 +58,38 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  uint64 index;
 
-  if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
+  if (((uint64)pa % PGSIZE) != 0 ||
+      (char *)pa < end ||
+      (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
+  index = (uint64)pa / PGSIZE;
+
+  acquire(&kmem.lock);
+
+  if (refcount[index] < 1)
+    panic("kfree refcount");
+
+  refcount[index]--;
+
+  // Another page table still refers to this physical page.
+  if (refcount[index] > 0) {
+    release(&kmem.lock);
+    return;
+  }
+
+  // Fill with junk only when the last reference disappears.
   memset(pa, 1, PGSIZE);
 
   r = (struct run *)pa;
-
-  acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
+
   release(&kmem.lock);
 }
+
 
 // Allocate one 4096-byte page of physical memory.
 // Returns a pointer that the kernel can use.
@@ -70,13 +99,57 @@ kalloc(void)
 {
   struct run *r;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
-  if (r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+acquire(&kmem.lock);
+r = kmem.freelist;
+if (r) {
+  kmem.freelist = r->next;
+  refcount[(uint64)r / PGSIZE] = 1;
+}
+release(&kmem.lock);
 
   if (r)
     memset((char *)r, 5, PGSIZE); // fill with junk
   return (void *)r;
 }
+
+// Add one reference to a shared physical page.
+void
+kaddref(void *pa)
+{
+  uint64 index = (uint64)pa / PGSIZE;
+
+  if (((uint64)pa % PGSIZE) != 0 ||
+      (char *)pa < end ||
+      (uint64)pa >= PHYSTOP)
+    panic("kaddref");
+
+  acquire(&kmem.lock);
+
+  if (refcount[index] < 1)
+    panic("kaddref refcount");
+
+  refcount[index]++;
+
+  release(&kmem.lock);
+}
+
+// Return the current number of references to a physical page.
+int
+kgetref(void *pa)
+{
+  int count;
+  uint64 index = (uint64)pa / PGSIZE;
+
+  if (((uint64)pa % PGSIZE) != 0 ||
+      (char *)pa < end ||
+      (uint64)pa >= PHYSTOP)
+    panic("kgetref");
+
+  acquire(&kmem.lock);
+  count = refcount[index];
+  release(&kmem.lock);
+
+  return count;
+}
+
+
